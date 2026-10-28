@@ -218,8 +218,42 @@ export interface PullRequest {
   targetRefName: string;
   mergeStatus: string;
   isDraft: boolean;
-  reviewers: Array<{ displayName: string; vote: number }>;
+  reviewers: Array<{ id: string; displayName: string; uniqueName?: string; vote: number; isRequired?: boolean }>;
   url: string;
+  repository?: { id: string; name: string; webUrl?: string };
+  lastMergeSourceCommit?: { commitId: string };
+  autoCompleteSetBy?: { displayName: string };
+  completionOptions?: { mergeStrategy?: string; deleteSourceBranch?: boolean };
+  labels?: Array<{ name: string }>;
+}
+
+export interface PullRequestComment {
+  id: number;
+  parentCommentId: number;
+  author: { displayName: string };
+  content?: string;
+  publishedDate: string;
+  commentType: string;
+  isDeleted?: boolean;
+}
+
+export interface PullRequestThread {
+  id: number;
+  status?: string;
+  publishedDate: string;
+  isDeleted: boolean;
+  threadContext?: {
+    filePath: string;
+    rightFileStart?: { line: number };
+    leftFileStart?: { line: number };
+  } | null;
+  comments: PullRequestComment[];
+}
+
+export interface PullRequestChange {
+  changeType: string;
+  item: { path: string; isFolder?: boolean };
+  originalPath?: string;
 }
 
 export interface GitCommit {
@@ -280,6 +314,8 @@ export interface BuildTimeline {
     finishTime?: string;
     errorCount: number;
     warningCount: number;
+    log?: { id: number } | null;
+    issues?: Array<{ type: string; message: string }> | null;
   }>;
 }
 
@@ -535,6 +571,19 @@ export class AzureDevOpsClient {
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`PATCH ${url} → ${res.status}: ${text}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  private async put<T>(url: string, body: unknown): Promise<T> {
+    const res = await this.request(url, {
+      method: "PUT",
+      headers: this.headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`PUT ${url} → ${res.status}: ${text}`);
     }
     return res.json() as Promise<T>;
   }
@@ -833,6 +882,8 @@ export class AzureDevOpsClient {
     await this.del(
       this.apis(`wit/workitems/${id}?destroy=${destroy}&api-version=7.1`),
     );
+    this.cache.invalidate(`wi:${id}`);
+    this.cache.invalidate(`wi-comments:${id}`);
   }
 
   /**
@@ -954,12 +1005,38 @@ export class AzureDevOpsClient {
   }
 
   async addComment(workItemId: number, text: string): Promise<WorkItemComment> {
-    return this.post<WorkItemComment>(
+    const c = await this.post<WorkItemComment>(
       this.apis(
         `wit/workItems/${workItemId}/comments?api-version=7.1-preview.3`,
       ),
       { text },
     );
+    this.cache.invalidate(`wi-comments:${workItemId}`);
+    return c;
+  }
+
+  async updateComment(
+    workItemId: number,
+    commentId: number,
+    text: string,
+  ): Promise<WorkItemComment> {
+    const c = await this.patch<WorkItemComment>(
+      this.apis(
+        `wit/workItems/${workItemId}/comments/${commentId}?api-version=7.1-preview.3`,
+      ),
+      { text },
+    );
+    this.cache.invalidate(`wi-comments:${workItemId}`);
+    return c;
+  }
+
+  async deleteComment(workItemId: number, commentId: number): Promise<void> {
+    await this.del(
+      this.apis(
+        `wit/workItems/${workItemId}/comments/${commentId}?api-version=7.1-preview.3`,
+      ),
+    );
+    this.cache.invalidate(`wi-comments:${workItemId}`);
   }
 
   // ── History / revisions ────────────────────────────────────────────────────
@@ -1360,7 +1437,10 @@ export class AzureDevOpsClient {
       isDraft: opts.isDraft ?? false,
     };
     if (opts.description) body["description"] = opts.description;
-    if (opts.reviewers?.length) body["reviewers"] = opts.reviewers.map((id) => ({ id }));
+    if (opts.reviewers?.length) {
+      const ids = await Promise.all(opts.reviewers.map((r) => this.resolveIdentityId(r)));
+      body["reviewers"] = ids.map((id) => ({ id }));
+    }
     if (opts.workItemIds?.length) {
       body["workItemRefs"] = opts.workItemIds.map((id) => ({
         id: String(id),
@@ -1371,6 +1451,163 @@ export class AzureDevOpsClient {
       this.apis(`git/repositories/${opts.repoId}/pullrequests?api-version=7.1`),
       body,
     );
+  }
+
+  /** Resolve an email, UPN or display name to an Azure DevOps identity ID. Passes GUIDs through. */
+  async resolveIdentityId(who: string): Promise<string> {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(who)) return who;
+    return this.cache.getOrFetch(`identity:${who.toLowerCase()}`, TTL.USER, async () => {
+      const p = new URLSearchParams({
+        searchFilter: "General",
+        filterValue: who,
+        queryMembership: "None",
+        "api-version": "7.1",
+      });
+      const res = await this.get<{ value: Array<{ id: string }> }>(
+        `https://vssps.dev.azure.com/${this.cfg.org}/_apis/identities?${p}`,
+      );
+      const id = res.value[0]?.id;
+      if (!id) throw new Error(`No Azure DevOps identity found for "${who}"`);
+      return id;
+    });
+  }
+
+  /** Identity ID of the authenticated user (PAT or OAuth). */
+  async getMyIdentityId(): Promise<string> {
+    return this.cache.getOrFetch("me-identity", TTL.USER, async () => {
+      const res = await this.get<{ authenticatedUser: { id: string } }>(
+        `${this.base}/_apis/connectionData`,
+      );
+      return res.authenticatedUser.id;
+    });
+  }
+
+  async updatePullRequest(
+    repoId: string,
+    prId: number,
+    body: Record<string, unknown>,
+  ): Promise<PullRequest> {
+    return this.patch<PullRequest>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}?api-version=7.1`),
+      body,
+    );
+  }
+
+  async setPullRequestVote(repoId: string, prId: number, vote: number): Promise<void> {
+    const me = await this.getMyIdentityId();
+    await this.put(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/reviewers/${me}?api-version=7.1`),
+      { vote },
+    );
+  }
+
+  async addPullRequestReviewer(
+    repoId: string,
+    prId: number,
+    who: string,
+    isRequired = false,
+  ): Promise<{ displayName: string }> {
+    const id = await this.resolveIdentityId(who);
+    return this.put<{ displayName: string }>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/reviewers/${id}?api-version=7.1`),
+      { vote: 0, isRequired },
+    );
+  }
+
+  async removePullRequestReviewer(repoId: string, prId: number, who: string): Promise<void> {
+    const id = await this.resolveIdentityId(who);
+    await this.del(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/reviewers/${id}?api-version=7.1`),
+    );
+  }
+
+  async listPullRequestThreads(repoId: string, prId: number): Promise<PullRequestThread[]> {
+    const res = await this.get<{ value: PullRequestThread[] }>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/threads?api-version=7.1`),
+    );
+    return res.value;
+  }
+
+  async createPullRequestThread(
+    repoId: string,
+    prId: number,
+    text: string,
+    file?: { path: string; line?: number },
+  ): Promise<PullRequestThread> {
+    const body: Record<string, unknown> = {
+      comments: [{ parentCommentId: 0, content: text, commentType: 1 }],
+      status: 1, // active
+    };
+    if (file) {
+      const path = file.path.startsWith("/") ? file.path : `/${file.path}`;
+      const line = file.line ?? 1;
+      body["threadContext"] = {
+        filePath: path,
+        rightFileStart: { line, offset: 1 },
+        rightFileEnd: { line, offset: 1 },
+      };
+    }
+    return this.post<PullRequestThread>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/threads?api-version=7.1`),
+      body,
+    );
+  }
+
+  async replyToPullRequestThread(
+    repoId: string,
+    prId: number,
+    threadId: number,
+    text: string,
+  ): Promise<PullRequestComment> {
+    return this.post<PullRequestComment>(
+      this.apis(
+        `git/repositories/${repoId}/pullrequests/${prId}/threads/${threadId}/comments?api-version=7.1`,
+      ),
+      { parentCommentId: 1, content: text, commentType: 1 },
+    );
+  }
+
+  async setPullRequestThreadStatus(
+    repoId: string,
+    prId: number,
+    threadId: number,
+    status: string,
+  ): Promise<void> {
+    await this.patch(
+      this.apis(
+        `git/repositories/${repoId}/pullrequests/${prId}/threads/${threadId}?api-version=7.1`,
+      ),
+      { status },
+    );
+  }
+
+  async listPullRequestChanges(repoId: string, prId: number): Promise<PullRequestChange[]> {
+    const iters = await this.get<{ value: Array<{ id: number }> }>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/iterations?api-version=7.1`),
+    );
+    const last = iters.value.at(-1);
+    if (!last) return [];
+    const changes: PullRequestChange[] = [];
+    let skip = 0;
+    // The changes endpoint pages at 100 entries per call
+    for (;;) {
+      const res = await this.get<{ changeEntries: PullRequestChange[] }>(
+        this.apis(
+          `git/repositories/${repoId}/pullrequests/${prId}/iterations/${last.id}/changes?$top=100&$skip=${skip}&api-version=7.1`,
+        ),
+      );
+      changes.push(...res.changeEntries);
+      if (res.changeEntries.length < 100) break;
+      skip += 100;
+    }
+    return changes;
+  }
+
+  async listPullRequestWorkItems(repoId: string, prId: number): Promise<number[]> {
+    const res = await this.get<{ value: Array<{ id: string }> }>(
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}/workitems?api-version=7.1`),
+    );
+    return res.value.map((w) => Number(w.id));
   }
 
   async getFileContent(

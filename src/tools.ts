@@ -76,14 +76,19 @@ function fmtWI(wi: WorkItem): string {
   return `#${wi.id} [${f["System.WorkItemType"]}/${f["System.State"]}] ${f["System.Title"]}${meta ? `  — ${meta}` : ""}`;
 }
 
-const TRUNC = 800; // max chars for long text fields
-
-function trunc(text: string): string {
-  return text.length > TRUNC ? text.slice(0, TRUNC) + `\n…(${text.length - TRUNC} more chars)` : text;
-}
-
 // Full detail view — used by get_work_item
-function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: string }; createdDate: string; text: string }>): string {
+// Rich text fields rendered as their own sections; anything else long or HTML lands under "Other Fields"
+const RICH_FIELDS: Record<string, string> = {
+  "System.Description": "Description",
+  "Microsoft.VSTS.Common.AcceptanceCriteria": "Acceptance Criteria",
+  "Microsoft.VSTS.TCM.ReproSteps": "Repro Steps",
+  "Microsoft.VSTS.TCM.SystemInfo": "System Info",
+};
+
+function fmtWIFull(
+  wi: WorkItem,
+  comments: Array<{ createdBy: { displayName: string }; createdDate: string; text: string }>,
+): string {
   const f = wi.fields;
   const dn = (key: string) =>
     (f[key] as { displayName?: string } | undefined)?.displayName ?? "";
@@ -113,19 +118,18 @@ function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: str
     `Updated: ${dn("System.ChangedBy")} · ${String(f["System.ChangedDate"] ?? "").slice(0, 10)}`,
   ].filter(Boolean).join("\n");
 
-  // ── Rich text fields (truncated to keep context lean) ─────────────────────
-  const description = f["System.Description"]
-    ? trunc(stripHtml(String(f["System.Description"])))
-    : "";
-  const acceptance = f["Microsoft.VSTS.Common.AcceptanceCriteria"]
-    ? trunc(stripHtml(String(f["Microsoft.VSTS.Common.AcceptanceCriteria"])))
-    : "";
-  const reproSteps = f["Microsoft.VSTS.TCM.ReproSteps"]
-    ? trunc(stripHtml(String(f["Microsoft.VSTS.TCM.ReproSteps"])))
-    : "";
-  const systemInfo = f["Microsoft.VSTS.TCM.SystemInfo"]
-    ? trunc(stripHtml(String(f["Microsoft.VSTS.TCM.SystemInfo"])))
-    : "";
+  // ── Rich text fields (full text, never truncated) ─────────────────────────
+  const rich = (key: string) => (f[key] ? stripHtml(String(f[key])) : "");
+
+  // Custom fields (e.g. Definition of Done) and other long text the core view doesn't cover
+  const extra = Object.entries(f)
+    .filter(([key, val]) =>
+      !(key in RICH_FIELDS) &&
+      typeof val === "string" &&
+      (key.startsWith("Custom.") || /<\/?[a-z][^>]*>/i.test(val) || val.length > 200),
+    )
+    .map(([key, val]) => `### ${key.split(".").pop()}\n${stripHtml(String(val))}`)
+    .join("\n\n");
 
   // ── Relations ─────────────────────────────────────────────────────────────
   type Rel = { rel: string; url: string; attributes: Record<string, unknown> };
@@ -180,22 +184,18 @@ function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: str
 
   const devLinks = [prSection, commitSection, buildSection].filter(Boolean).join("\n\n");
 
-  // ── Comments (last 5 only to keep context lean) ───────────────────────────
-  const recentComments = comments.slice(-5);
+  // ── Comments (all of them, full text) ─────────────────────────────────────
   const commentBlock =
     comments.length === 0
       ? "No comments."
-      : (comments.length > 5 ? `(${comments.length - 5} earlier comments omitted)\n\n` : "") +
-        recentComments
-          .map((c) => `[${c.createdDate.slice(0, 10)}] ${c.createdBy.displayName}\n${trunc(stripHtml(c.text))}`)
+      : comments
+          .map((c) => `[${c.createdDate.slice(0, 10)}] ${c.createdBy.displayName}\n${stripHtml(c.text)}`)
           .join("\n\n");
 
   return [
     core,
-    section("Description", description),
-    section("Acceptance Criteria", acceptance),
-    section("Repro Steps", reproSteps),
-    section("System Info", systemInfo),
+    ...Object.entries(RICH_FIELDS).map(([key, title]) => section(title, rich(key))),
+    section("Other Fields", extra),
     relLines.length ? section("Linked Work Items", relLines.join("\n")) : "",
     devLinks ? section("Development & Deployment", devLinks) : "",
     section("Comments", commentBlock),
@@ -249,6 +249,15 @@ function fmtOffsetPage(body: string, count: number, skip: number, top: number): 
   return `${header}:\n\n${body}${more}`;
 }
 
+const voteLabel = (vote: number) =>
+  vote === 10 ? "approved"
+  : vote === 5 ? "approved with suggestions"
+  : vote === -5 ? "waiting for author"
+  : vote === -10 ? "rejected"
+  : "no vote";
+
+const indent = (text: string, n: number) => text.replace(/^/gm, " ".repeat(n));
+
 const str = (a: Record<string, unknown>, k: string) => a[k] as string;
 const num = (a: Record<string, unknown>, k: string) => a[k] as number;
 const opt = <T>(a: Record<string, unknown>, k: string): T | undefined =>
@@ -261,6 +270,15 @@ const opt = <T>(a: Record<string, unknown>, k: string): T | undefined =>
 const WI_STATES = ["New", "Active", "Resolved", "Closed", "Done", "In Progress", "Removed"];
 const WI_TYPES = ["Task", "Bug", "User Story", "Epic", "Feature", "Issue", "Test Case", "Test Plan"];
 const PR_STATUSES = ["active", "completed", "abandoned", "all"];
+const PR_VOTES: Record<string, number> = {
+  approve: 10,
+  approve_with_suggestions: 5,
+  reset: 0,
+  wait_for_author: -5,
+  reject: -10,
+};
+const THREAD_STATUSES = ["active", "fixed", "wontFix", "closed", "byDesign", "pending"];
+const MERGE_STRATEGIES = ["squash", "noFastForward", "rebase", "rebaseMerge"];
 const BUILD_STATUSES = ["all", "inProgress", "completed", "notStarted"];
 const BUILD_RESULTS = ["succeeded", "failed", "canceled", "partiallySucceeded"];
 const RELEASE_STATUSES = ["draft", "active", "abandoned"];
@@ -370,6 +388,66 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_comments",
+    description: "List discussion comments on a work item, with their IDs (needed to edit/delete).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workItemId: { type: "number" },
+      },
+      required: ["workItemId"],
+    },
+  },
+  {
+    name: "update_comment",
+    description: "Edit an existing discussion comment. Get the commentId from list_comments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workItemId: { type: "number" },
+        commentId: { type: "number" },
+        text: { type: "string", description: "New comment text (replaces the old)" },
+      },
+      required: ["workItemId", "commentId", "text"],
+    },
+  },
+  {
+    name: "delete_comment",
+    description: "Delete a discussion comment. Get the commentId from list_comments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workItemId: { type: "number" },
+        commentId: { type: "number" },
+      },
+      required: ["workItemId", "commentId"],
+    },
+  },
+  {
+    name: "delete_work_item",
+    description: "Delete a work item. By default moves to Recycle Bin (recoverable); pass destroy:true to permanently delete.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number" },
+        destroy: { type: "boolean", description: "Permanently destroy instead of recycle bin (default false)" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_child_work_items",
+    description: "List the child work items (subtasks) of a work item with state, assignee and points.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Parent work item ID" },
+        recursive: { type: "boolean", description: "Walk the whole subtree, not just direct children (default false)" },
+      },
+      required: ["id"],
+    },
+  },
+  {
     name: "link_work_items",
     description: "Link two work items (parent/child, related, dependency).",
     inputSchema: {
@@ -464,13 +542,129 @@ export const TOOLS: Tool[] = [
         repo: { type: "string" },
         title: { type: "string" },
         sourceBranch: { type: "string" },
-        targetBranch: { type: "string", description: "Default: main" },
+        targetBranch: { type: "string", description: "Default: the repo's default branch" },
         description: { type: "string" },
         isDraft: { type: "boolean" },
         reviewers: { type: "array", items: { type: "string" }, description: "Email addresses" },
         workItemIds: { type: "array", items: { type: "number" } },
+        autoComplete: { type: "boolean", description: "Merge (squash, delete source branch) once policies pass" },
       },
       required: ["repo", "title", "sourceBranch"],
+    },
+  },
+  {
+    name: "get_pull_request",
+    description: "Full detail for one PR: description, branches, merge status, reviewers and votes, linked work items, changed files, open thread count.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+      },
+      required: ["repo", "id"],
+    },
+  },
+  {
+    name: "list_pr_comments",
+    description: "List PR comment threads with file/line context, status, and every reply. Thread IDs are needed to reply or resolve.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        includeResolved: { type: "boolean", description: "Include fixed/closed threads (default true)" },
+      },
+      required: ["repo", "id"],
+    },
+  },
+  {
+    name: "add_pr_comment",
+    description: "Comment on a PR. Pass threadId to reply in a thread, filePath (+line) for an inline file comment, or neither for a general comment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        text: { type: "string", description: "Markdown" },
+        threadId: { type: "number", description: "Reply to this thread" },
+        filePath: { type: "string", description: "Comment on this file (e.g. /src/app.ts)" },
+        line: { type: "number", description: "Line in the new version of the file" },
+      },
+      required: ["repo", "id", "text"],
+    },
+  },
+  {
+    name: "update_pr_thread",
+    description: "Set a PR comment thread's status, e.g. resolve it (fixed) or reopen it (active).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        threadId: { type: "number" },
+        status: { type: "string", enum: THREAD_STATUSES },
+      },
+      required: ["repo", "id", "threadId", "status"],
+    },
+  },
+  {
+    name: "vote_pr",
+    description: "Vote on a PR as the signed-in user: approve, approve_with_suggestions, wait_for_author, reject, or reset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        vote: { type: "string", enum: Object.keys(PR_VOTES) },
+      },
+      required: ["repo", "id", "vote"],
+    },
+  },
+  {
+    name: "manage_pr_reviewers",
+    description: "Add or remove PR reviewers by email, UPN, or identity ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        add: { type: "array", items: { type: "string" } },
+        remove: { type: "array", items: { type: "string" } },
+        required: { type: "boolean", description: "Mark added reviewers as required (default false)" },
+      },
+      required: ["repo", "id"],
+    },
+  },
+  {
+    name: "update_pr",
+    description: "Edit a PR (title, description, draft), set auto-complete, complete (merge), abandon, or reactivate it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        id: { type: "number", description: "Pull request ID" },
+        title: { type: "string" },
+        description: { type: "string" },
+        isDraft: { type: "boolean", description: "false publishes a draft" },
+        action: {
+          type: "string",
+          enum: ["complete", "abandon", "reactivate", "auto_complete", "cancel_auto_complete"],
+          description: "complete merges now; auto_complete merges once policies pass",
+        },
+        mergeStrategy: { type: "string", enum: MERGE_STRATEGIES, description: "For complete/auto_complete (default squash)" },
+        deleteSourceBranch: { type: "boolean", description: "For complete/auto_complete (default true)" },
+        mergeMessage: { type: "string", description: "Merge commit message for complete/auto_complete" },
+      },
+      required: ["repo", "id"],
+    },
+  },
+  {
+    name: "list_branches",
+    description: "List a repo's branches with ahead/behind counts against the default branch.",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
     },
   },
   {
@@ -507,12 +701,14 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "get_build_logs",
-    description: "Get build output logs (last 80 lines) to diagnose failures.",
+    description: "Get pipeline/build logs. With no logId or step, returns the full logs and error messages of every failed step, or the list of step logs if nothing failed.",
     inputSchema: {
       type: "object",
       properties: {
         buildId: { type: "number" },
-        logId: { type: "number", description: "Specific log (omit for latest)" },
+        logId: { type: "number", description: "A specific log ID (from the step list)" },
+        step: { type: "string", description: "Step/task/job name (case-insensitive substring), e.g. \"npm test\"" },
+        tail: { type: "number", description: "Only the last N lines (default: whole log)" },
       },
       required: ["buildId"],
     },
@@ -795,7 +991,61 @@ export async function handleTool(
 
       case "add_comment": {
         const c = await client.addComment(num(args, "workItemId"), str(args, "text"));
-        return ok(`Comment added by ${c.createdBy.displayName} at ${c.createdDate.slice(0, 16)}`);
+        return ok(`Comment #${c.id} added by ${c.createdBy.displayName} at ${c.createdDate.slice(0, 16)}`);
+      }
+
+      case "list_comments": {
+        const comments = await client.listComments(num(args, "workItemId"));
+        if (comments.length === 0) return ok("No comments on this work item.");
+        return ok(
+          comments
+            .map((c) =>
+              [
+                `#${c.id} — ${c.createdBy.displayName} at ${c.createdDate.slice(0, 16)}`,
+                c.text,
+              ].join("\n"),
+            )
+            .join("\n\n"),
+        );
+      }
+
+      case "update_comment": {
+        const c = await client.updateComment(
+          num(args, "workItemId"),
+          num(args, "commentId"),
+          str(args, "text"),
+        );
+        return ok(`Comment #${c.id} updated.`);
+      }
+
+      case "delete_comment": {
+        await client.deleteComment(num(args, "workItemId"), num(args, "commentId"));
+        return ok(`Comment #${num(args, "commentId")} deleted.`);
+      }
+
+      case "delete_work_item": {
+        const destroy = opt<boolean>(args, "destroy") ?? false;
+        await client.deleteWorkItem(num(args, "id"), destroy);
+        return ok(
+          destroy
+            ? `Work item #${num(args, "id")} permanently destroyed.`
+            : `Work item #${num(args, "id")} moved to Recycle Bin (recoverable).`,
+        );
+      }
+
+      case "list_child_work_items": {
+        const rootId = num(args, "id");
+        const recursive = opt<boolean>(args, "recursive") ?? false;
+        const lines: string[] = [];
+        const walk = async (parentId: number, depth: number): Promise<void> => {
+          const kids = await client.getWorkItemChildren(parentId);
+          for (const k of kids) {
+            lines.push(fmtWI(k).replace(/^/gm, "  ".repeat(depth)));
+            if (recursive) await walk(k.id, depth + 1);
+          }
+        };
+        await walk(rootId, 0);
+        return ok(lines.length ? `Children of #${rootId}:\n\n${lines.join("\n")}` : `#${rootId} has no child work items.`);
       }
 
       case "link_work_items": {
@@ -875,7 +1125,7 @@ export async function handleTool(
               `  Branch: ${pr.sourceRefName.replace("refs/heads/", "")} → ${pr.targetRefName.replace("refs/heads/", "")}`,
               `  Merge:  ${pr.mergeStatus}`,
               pr.reviewers.length
-                ? `  Votes:  ${pr.reviewers.map((r) => `${r.displayName}:${r.vote > 0 ? "approved" : r.vote < 0 ? "rejected" : "pending"}`).join(", ")}`
+                ? `  Votes:  ${pr.reviewers.map((r) => `${r.displayName}:${voteLabel(r.vote)}`).join(", ")}`
                 : "",
             ]
               .filter(Boolean)
@@ -886,16 +1136,27 @@ export async function handleTool(
       }
 
       case "create_pr": {
-        const pr = await client.createPullRequest({
-          repoId: str(args, "repo"),
+        const repo = str(args, "repo");
+        const targetBranch =
+          opt<string>(args, "targetBranch") ??
+          (await client.getRepository(repo)).defaultBranch ??
+          "main";
+        let pr = await client.createPullRequest({
+          repoId: repo,
           title: str(args, "title"),
           sourceBranch: str(args, "sourceBranch"),
-          targetBranch: opt<string>(args, "targetBranch") ?? "main",
+          targetBranch,
           description: opt<string>(args, "description"),
           isDraft: opt<boolean>(args, "isDraft"),
           reviewers: opt<string[]>(args, "reviewers"),
           workItemIds: opt<number[]>(args, "workItemIds"),
         });
+        if (opt<boolean>(args, "autoComplete")) {
+          pr = await client.updatePullRequest(repo, pr.pullRequestId, {
+            autoCompleteSetBy: { id: await client.getMyIdentityId() },
+            completionOptions: { mergeStrategy: "squash", deleteSourceBranch: true },
+          });
+        }
         return ok(
           [
             `Pull request created:`,
@@ -903,8 +1164,181 @@ export async function handleTool(
             `  ${pr.sourceRefName.replace("refs/heads/", "")} → ${pr.targetRefName.replace("refs/heads/", "")}`,
             `  Status: ${pr.status}${pr.isDraft ? " (draft)" : ""}`,
             pr.reviewers.length ? `  Reviewers: ${pr.reviewers.map((r) => r.displayName).join(", ")}` : "",
+            pr.autoCompleteSetBy ? `  Auto-complete: on` : "",
           ]
             .filter(Boolean)
+            .join("\n"),
+        );
+      }
+
+      case "get_pull_request": {
+        const repo = str(args, "repo");
+        const id = num(args, "id");
+        const [pr, changes, threads, wiIds] = await Promise.all([
+          client.getPullRequest(repo, id),
+          client.listPullRequestChanges(repo, id).catch(() => []),
+          client.listPullRequestThreads(repo, id).catch(() => []),
+          client.listPullRequestWorkItems(repo, id).catch(() => []),
+        ]);
+        const br = (r: string) => r.replace("refs/heads/", "");
+        const reviewers = pr.reviewers.map(
+          (r) => `  • ${r.displayName}${r.isRequired ? " (required)" : ""}: ${voteLabel(r.vote)}`,
+        );
+        const userThreads = threads.filter(
+          (t) => !t.isDeleted && t.comments.some((c) => c.commentType === "text"),
+        );
+        const open = userThreads.filter((t) => t.status === "active" || t.status === "pending");
+        const files = changes
+          .filter((c) => !c.item.isFolder)
+          .map((c) => `  ${c.changeType.padEnd(8)} ${c.item.path}${c.originalPath ? `  (from ${c.originalPath})` : ""}`);
+        return ok(
+          [
+            `# PR #${pr.pullRequestId}: ${pr.title}`,
+            ``,
+            `Status:  ${pr.status}${pr.isDraft ? " (draft)" : ""}`,
+            `Branch:  ${br(pr.sourceRefName)} → ${br(pr.targetRefName)}`,
+            `Merge:   ${pr.mergeStatus}`,
+            `By:      ${pr.createdBy.displayName} · ${pr.creationDate.slice(0, 10)}`,
+            pr.closedDate ? `Closed:  ${pr.closedDate.slice(0, 10)}` : "",
+            pr.autoCompleteSetBy ? `Auto-complete: set by ${pr.autoCompleteSetBy.displayName}` : "",
+            pr.labels?.length ? `Labels:  ${pr.labels.map((l) => l.name).join(", ")}` : "",
+            pr.repository?.webUrl ? `URL:     ${pr.repository.webUrl}/pullrequest/${pr.pullRequestId}` : "",
+            pr.description ? `\n## Description\n${pr.description}` : "",
+            `\n## Reviewers\n${reviewers.length ? reviewers.join("\n") : "  none"}`,
+            wiIds.length ? `\n## Linked Work Items\n  ${wiIds.map((w) => `#${w}`).join(", ")}` : "",
+            `\n## Comments\n  ${userThreads.length} thread(s), ${open.length} open. Use list_pr_comments to read them.`,
+            `\n## Changed Files (${files.length})\n${files.join("\n") || "  none"}`,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      }
+
+      case "list_pr_comments": {
+        const includeResolved = opt<boolean>(args, "includeResolved") ?? true;
+        const threads = (await client.listPullRequestThreads(str(args, "repo"), num(args, "id")))
+          .filter((t) => !t.isDeleted && t.comments.some((c) => c.commentType === "text"))
+          .filter((t) => includeResolved || t.status === "active" || t.status === "pending");
+        if (threads.length === 0) return ok("No comment threads.");
+        return ok(
+          threads
+            .map((t) => {
+              const ctx = t.threadContext;
+              const line = ctx?.rightFileStart?.line ?? ctx?.leftFileStart?.line;
+              const where = ctx ? `${ctx.filePath}${line ? `:${line}` : ""}` : "general";
+              const comments = t.comments
+                .filter((c) => c.commentType === "text" && !c.isDeleted)
+                .map((c) => `  ${c.parentCommentId ? "↳ " : ""}${c.author.displayName} · ${c.publishedDate.slice(0, 16).replace("T", " ")}\n${indent(c.content ?? "", c.parentCommentId ? 6 : 4)}`);
+              return `Thread #${t.id} [${t.status ?? "—"}] ${where}\n${comments.join("\n")}`;
+            })
+            .join("\n\n"),
+        );
+      }
+
+      case "add_pr_comment": {
+        const repo = str(args, "repo");
+        const id = num(args, "id");
+        const threadId = opt<number>(args, "threadId");
+        if (threadId != null) {
+          const c = await client.replyToPullRequestThread(repo, id, threadId, str(args, "text"));
+          return ok(`Replied in thread #${threadId} (comment ${c.id}).`);
+        }
+        const filePath = opt<string>(args, "filePath");
+        const t = await client.createPullRequestThread(
+          repo,
+          id,
+          str(args, "text"),
+          filePath ? { path: filePath, line: opt<number>(args, "line") } : undefined,
+        );
+        return ok(`Thread #${t.id} created on PR #${id}${filePath ? ` at ${filePath}${opt<number>(args, "line") ? `:${opt<number>(args, "line")}` : ""}` : ""}.`);
+      }
+
+      case "update_pr_thread": {
+        await client.setPullRequestThreadStatus(
+          str(args, "repo"),
+          num(args, "id"),
+          num(args, "threadId"),
+          str(args, "status"),
+        );
+        return ok(`Thread #${num(args, "threadId")} set to ${str(args, "status")}.`);
+      }
+
+      case "vote_pr": {
+        const vote = PR_VOTES[str(args, "vote")];
+        if (vote == null) return fail(`Unknown vote "${str(args, "vote")}". Use one of: ${Object.keys(PR_VOTES).join(", ")}`);
+        await client.setPullRequestVote(str(args, "repo"), num(args, "id"), vote);
+        return ok(`Voted ${voteLabel(vote)} on PR #${num(args, "id")}.`);
+      }
+
+      case "manage_pr_reviewers": {
+        const repo = str(args, "repo");
+        const id = num(args, "id");
+        const add = opt<string[]>(args, "add") ?? [];
+        const remove = opt<string[]>(args, "remove") ?? [];
+        if (!add.length && !remove.length) return fail("Pass reviewers to add and/or remove.");
+        const required = opt<boolean>(args, "required") ?? false;
+        const added = await Promise.all(add.map((r) => client.addPullRequestReviewer(repo, id, r, required)));
+        await Promise.all(remove.map((r) => client.removePullRequestReviewer(repo, id, r)));
+        return ok(
+          [
+            added.length ? `Added${required ? " (required)" : ""}: ${added.map((r) => r.displayName).join(", ")}` : "",
+            remove.length ? `Removed: ${remove.join(", ")}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      }
+
+      case "update_pr": {
+        const repo = str(args, "repo");
+        const id = num(args, "id");
+        const action = opt<string>(args, "action");
+        const body: Record<string, unknown> = {};
+        for (const k of ["title", "description", "isDraft"]) if (args[k] != null) body[k] = args[k];
+        const completionOptions = {
+          mergeStrategy: opt<string>(args, "mergeStrategy") ?? "squash",
+          deleteSourceBranch: opt<boolean>(args, "deleteSourceBranch") ?? true,
+          ...(opt<string>(args, "mergeMessage") ? { mergeCommitMessage: opt<string>(args, "mergeMessage") } : {}),
+        };
+        if (action === "complete") {
+          const cur = await client.getPullRequest(repo, id);
+          body["status"] = "completed";
+          body["lastMergeSourceCommit"] = cur.lastMergeSourceCommit;
+          body["completionOptions"] = completionOptions;
+        } else if (action === "abandon") {
+          body["status"] = "abandoned";
+        } else if (action === "reactivate") {
+          body["status"] = "active";
+        } else if (action === "auto_complete") {
+          body["autoCompleteSetBy"] = { id: await client.getMyIdentityId() };
+          body["completionOptions"] = completionOptions;
+        } else if (action === "cancel_auto_complete") {
+          body["autoCompleteSetBy"] = { id: "00000000-0000-0000-0000-000000000000" };
+        }
+        if (Object.keys(body).length === 0) return fail("Nothing to update. Pass a field to change or an action.");
+        const pr = await client.updatePullRequest(repo, id, body);
+        return ok(
+          [
+            `PR #${pr.pullRequestId}: ${pr.title}`,
+            `  Status: ${pr.status}${pr.isDraft ? " (draft)" : ""}`,
+            `  Merge:  ${pr.mergeStatus}`,
+            pr.autoCompleteSetBy ? `  Auto-complete: set by ${pr.autoCompleteSetBy.displayName}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      }
+
+      case "list_branches": {
+        const branches = await client.listBranches(str(args, "repo"));
+        if (branches.length === 0) return ok("No branches.");
+        return ok(
+          branches
+            .map((b) =>
+              b.isBaseVersion
+                ? `${b.name}  (default)`
+                : `${b.name}  ↑${b.aheadCount} ↓${b.behindCount}`,
+            )
             .join("\n"),
         );
       }
@@ -1003,22 +1437,44 @@ export async function handleTool(
 
       case "get_build_logs": {
         const buildId = num(args, "buildId");
-        const logId = opt<number>(args, "logId");
-        if (logId != null) {
-          const text = await client.getBuildLogContent(buildId, logId);
+        const tail = opt<number>(args, "tail");
+        const cut = (text: string) => {
+          if (tail == null) return text;
           const lines = text.split("\n");
-          const tail = lines.slice(-80).join("\n");
-          return ok(lines.length > 80 ? `... (${lines.length - 80} lines above)\n\n${tail}` : tail);
+          return lines.length > tail ? `... (${lines.length - tail} lines above)\n${lines.slice(-tail).join("\n")}` : text;
+        };
+        const logId = opt<number>(args, "logId");
+        if (logId != null) return ok(cut(await client.getBuildLogContent(buildId, logId)));
+
+        const records = (await client.getBuildTimeline(buildId)).records ?? [];
+        const withLogs = records.filter((r) => r.log?.id != null);
+        const step = opt<string>(args, "step")?.toLowerCase();
+        const picked: typeof withLogs = step
+          ? withLogs.filter((r) => r.name.toLowerCase().includes(step))
+          : withLogs.filter((r) => r.result === "failed" && r.type === "Task");
+        // A job can fail with no failed task (timeout, agent loss): fall back to any failed record
+        if (!step && picked.length === 0) picked.push(...withLogs.filter((r) => r.result === "failed"));
+        if (step && picked.length === 0) {
+          return fail(`No step matching "${step}". Steps: ${withLogs.map((r) => r.name).join(", ")}`);
         }
-        // No logId — list logs and return the last task log content
-        const logs = await client.getBuildLogs(buildId);
-        if (logs.length === 0) return ok("No logs available yet.");
-        const last = logs[logs.length - 1]!;
-        const text = await client.getBuildLogContent(buildId, last.id);
-        const lines = text.split("\n");
-        const tail = lines.slice(-80).join("\n");
-        const header = `Build #${buildId} — log ${last.id}/${logs.length} (last 80 lines)\n\n`;
-        return ok(header + (lines.length > 80 ? `... (${lines.length - 80} lines above)\n\n${tail}` : tail));
+        if (picked.length === 0) {
+          if (withLogs.length === 0) return ok("No logs available yet.");
+          return ok(
+            `Build #${buildId}: no failed steps. Step logs (pass logId or step):\n\n` +
+              withLogs
+                .sort((x, y) => (x.startTime ?? "").localeCompare(y.startTime ?? ""))
+                .map((r) => `  log ${r.log!.id}  [${r.type}/${r.result ?? r.state}] ${r.name}`)
+                .join("\n"),
+          );
+        }
+        const blocks = await Promise.all(
+          picked.map(async (r) => {
+            const issues = (r.issues ?? []).map((i) => `  ${i.type}: ${i.message}`).join("\n");
+            const text = await client.getBuildLogContent(buildId, r.log!.id);
+            return `## ${r.name}  [${r.result ?? r.state}]  log ${r.log!.id}${issues ? `\n${issues}` : ""}\n\n${cut(text)}`;
+          }),
+        );
+        return ok(blocks.join("\n\n"));
       }
 
       // ── Sprints ──────────────────────────────────────────────────────────────
@@ -1108,14 +1564,15 @@ export async function handleTool(
         const short = (k: string) => k.split(".").pop() ?? k;
         const val = (v: unknown) => {
           if (v == null || v === "") return "—";
-          const s = typeof v === "object" && v && "displayName" in v
+          return typeof v === "object" && v && "displayName" in v
             ? String((v as { displayName: string }).displayName)
             : stripHtml(String(v));
-          return s.length > 80 ? s.slice(0, 80) + "…" : s;
         };
         const blocks = meaningful.map((u) => {
           const who = u.revisedBy?.displayName ?? "—";
-          const when = u.revisedDate?.slice(0, 16).replace("T", " ") ?? "—";
+          // revisedDate is when this revision was superseded (9999 for the latest); ChangedDate is when it happened
+          const changed = u.fields["System.ChangedDate"]?.newValue;
+          const when = String(changed ?? u.revisedDate ?? "—").slice(0, 16).replace("T", " ");
           const changes = Object.entries(u.fields)
             .filter(([k]) => !SKIP.has(k))
             .map(([k, d]) => `  ${short(k)}: ${val(d.oldValue)} → ${val(d.newValue)}`);

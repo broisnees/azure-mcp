@@ -159,10 +159,13 @@ AUTHENTICATE FLAGS
 | Tool | When to use |
 |---|---|
 | `list_work_items` | My tasks, sprint board, filter by state/type/keyword (paginated) |
-| `get_work_item` | Full detail on a specific ticket — fields, comments, PRs |
+| `get_work_item` | Full detail on a specific ticket: every field (custom ones like Definition of Done too), all comments, PRs. Nothing truncated |
 | `create_work_item` | Create a task, bug, user story, epic, feature |
 | `update_work_item` | Close, reassign, move sprint, update estimates |
 | `add_comment` | Post a note or status update on a ticket |
+| `list_comments` / `update_comment` / `delete_comment` | Read, edit, or delete ticket comments by ID |
+| `list_child_work_items` | Subtasks of a ticket, optionally the whole subtree |
+| `delete_work_item` | Move to Recycle Bin, or destroy permanently |
 | `link_work_items` | Set parent/child, related, or dependency links |
 | `query_wiql` | Advanced queries with custom WIQL (paginated) |
 | `get_work_item_history` | Audit trail — which fields changed, when, by whom |
@@ -185,7 +188,15 @@ AUTHENTICATE FLAGS
 | `get_file` | Read file contents (up to 500 lines) |
 | `list_commits` | Recent commits on a branch (paginated) |
 | `list_pull_requests` | Open PRs, reviewer votes, merge status (paginated) |
-| `create_pr` | Open a PR with optional reviewers and linked work items |
+| `list_branches` | Branches with ahead/behind counts |
+| `create_pr` | Open a PR with reviewers (by email), linked work items, optional auto-complete |
+| `get_pull_request` | Full PR: description, reviewers and votes, linked work items, changed files |
+| `list_pr_comments` | Comment threads with file/line context and replies |
+| `add_pr_comment` | General comment, inline file comment, or reply to a thread |
+| `update_pr_thread` | Resolve or reopen a thread |
+| `vote_pr` | Approve, approve with suggestions, wait for author, reject, reset |
+| `manage_pr_reviewers` | Add (optionally required) or remove reviewers |
+| `update_pr` | Edit title/description/draft, complete (merge), auto-complete, abandon, reactivate |
 
 ### Pipelines, builds & releases
 | Tool | When to use |
@@ -194,7 +205,7 @@ AUTHENTICATE FLAGS
 | `list_builds` | Recent builds — status, result, branch, link |
 | `run_pipeline` | Trigger a pipeline run |
 | `get_build_timeline` | Which stage/job/task failed, with error/warning counts |
-| `get_build_logs` | Diagnose build failures (build output) |
+| `get_build_logs` | Full logs and error messages of failed steps, or any step by name or log ID |
 | `cancel_build` | Cancel an in-progress build |
 | `list_releases` | Recent releases with per-environment deploy status |
 | `create_release` | Create and trigger a release from a definition |
